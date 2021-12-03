@@ -1,23 +1,34 @@
 import java.io.*;
-import java.net.*;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.Iterator;
 import java.util.TimeZone;
 
-
 public class Client {
-    private static final int SERVER_PORT = 8888; //порт сервера
+    private static final int SERVER_PORT = 8888;
     private static final String HOST = "127.0.0.1";
     private final static int MIN_NAME_SIZE = 2;
     private final static int MAX_NAME_SIZE = 30;
     private final static int MAX_FILE_SIZE = 5242880; // 5Mb
 
-    private static Socket socket; //сокет для общения с сервером
-    private static BufferedReader reader; //ридер для чтение с консоли
-    private static DataInputStream input; //чтение из сокета
-    private static DataOutputStream output; //запись в сокет
+    private Selector selector;
+    private SocketChannel clientChannel;
+    private boolean isConnected = false;
+    private boolean readerThread = false;
+    private ByteBuffer buffer;
+    private String message = "";
 
+    private Thread thread;
+    private static BufferedReader reader; //ридер для чтение с консоли
+    private TimeZone tz;
     private String clientName;
+
 
     public static void main(String[] args) {
         new Client().launch();
@@ -26,34 +37,92 @@ public class Client {
     private void launch() {
         try {
             reader = new BufferedReader(new InputStreamReader(System.in));
-            TimeZone tz = TimeZone.getDefault();
+            tz = TimeZone.getDefault();
+            buffer = ByteBuffer.allocate(100000);
+
+            selector = Selector.open();
+            clientChannel = SocketChannel.open();
+            clientChannel.configureBlocking(false);
+
+            clientChannel.register(selector, SelectionKey.OP_CONNECT);
+            clientChannel.connect(new InetSocketAddress(HOST, SERVER_PORT));
 
             while (true) {
-                socket = new Socket(HOST, SERVER_PORT); //попытка подключения к серверу
-                input = new DataInputStream(socket.getInputStream()); //получение входного потока с сервера
-                output = new DataOutputStream(socket.getOutputStream()); //получение выходного потока с сервера
+                selector.select(100);
+                Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
+                SelectionKey key;
 
-                enterUserName(); //ввод имени
-                output.writeUTF(clientName.trim() + " " + tz.getID() + "\n"); //отправка имени и временной зоны на сервер
-                output.flush();
+                while (keys.hasNext()) {
+                    key = keys.next();
+                    keys.remove();
 
-                if (input.readUTF().equals("/refuse")){
-                    System.out.println("Это имя уже занято");
-                } else {
-                    System.out.println("Вы подключены");
-                    break;
+                    if (!key.isValid()) continue;
+
+                    if (key.isConnectable()) {
+                        connect(key);
+                    }
+                    if (key.isReadable()) {
+                        read(key);
+                    }
+                    if (key.isWritable()) {
+                        write(key);
+                    }
                 }
             }
 
-            new ReceiveMessage().start(); //запуск потока чтения сообщений с сервера
-            new SendMessage().start(); //запуск потока чтения сообщений клиента
         } catch (IOException e) {
             System.out.println("Ошибка подключения");
             System.exit(-1);
         }
     }
 
-    public void enterUserName() {
+    private void connect(SelectionKey key) throws IOException {
+        SocketChannel channel = (SocketChannel) key.channel();
+        if (channel.isConnectionPending()) {
+            channel.finishConnect();
+        }
+        channel.configureBlocking(false);
+        channel.register(selector, SelectionKey.OP_WRITE);
+    }
+
+    private void write(SelectionKey key) {
+        try {
+            SocketChannel clientSocket = (SocketChannel) key.channel();
+
+            if (!isConnected) {
+                enterUserName();
+                String nameLine = "/name " + clientName.trim() + " " + tz.getID() + "\n";
+                buffer.clear();
+                buffer.limit(nameLine.length());
+                buffer = ByteBuffer.wrap(nameLine.getBytes());
+                clientSocket.write(buffer);
+            } else {
+                if (!readerThread){
+                    thread = new Thread(()-> {
+                        try {
+                            while (true) {
+                                message = reader.readLine().trim(); //чтение сообщения клиента
+                                key.interestOps(SelectionKey.OP_WRITE);
+                            }
+                        } catch (IOException e) {
+                            System.out.println("Ошибка при чтении с консоли");
+                        }
+                    });
+                    thread.start();
+                    readerThread = true;
+                }
+                sendMessage(clientSocket, key);
+                message = "";
+            }
+            key.interestOps(SelectionKey.OP_READ);
+        } catch (IOException e) {
+            System.out.println("Ошибка отправки сообщения");
+            closeSocket(key);
+            System.exit(-1);
+        }
+    }
+
+    private void enterUserName() {
         try {
             while (true) {
                 System.out.print("Введите ваше имя: ");
@@ -70,121 +139,140 @@ public class Client {
         }
     }
 
-    private void closeSocket() {
-        try {
-            if (!socket.isClosed()) {
-                input.close();
-                output.close();
-                socket.close();
-            }
-        } catch (IOException e) {
-            System.out.println("Ошибка при закрытии сокета");
-            System.exit(-1);
-        }
-    }
+    private void sendMessage(SocketChannel channel,SelectionKey key) throws IOException{
 
-
-    private class ReceiveMessage extends Thread {
-        @Override
-        public void run() {
-            try {
-                while (true) {
-                    String msg = input.readUTF();
-                    if (msg.split(" ", 2)[0].equals("/file")){
-                        receiveFileOnClient(msg.split(" ", 2)[1]);
-                    } else {
-                        if (msg.equals("/stop")) {
-                            System.out.println("Работа сервера остановлена");
-                            closeSocket();
-                            System.exit(-1);
-                            break;
-                        } else {
-                            String[] partsOfMsg = msg.split(";", 3);
-                            String text = String.format("<%s> [%s]: %s", partsOfMsg[0], partsOfMsg[1], partsOfMsg[2]);
-                            System.out.println(text);
-                        }
-                    }
-                }
-            } catch (IOException e) {
-                System.out.println("Проблемы при работе с сервером");
-                closeSocket();
-                System.exit(-1);
-            }
-        }
-
-        private void receiveFileOnClient(String receivedFile) throws IOException{
-            try {
-                int bytes;
-                new File("C:\\chat\\" + clientName).mkdirs();
-                FileOutputStream fileOutputStream = new FileOutputStream("C:\\chat\\" + clientName + "\\" + receivedFile);
-                long fileSize = input.readLong();
-                byte[] buffer = new byte[4 * 1024];
-
-                while (fileSize > 0 && (bytes = input.read(buffer, 0, (int) Math.min(buffer.length, fileSize))) != -1) {
-                    fileOutputStream.write(buffer, 0, bytes);
-                    fileSize -= bytes;
-                }
-                fileOutputStream.close();
-                System.out.println("Получен файл " + receivedFile);
-            } catch (FileNotFoundException e) {
-                System.out.println("Ошибка при получении файла");
-            }
-        }
-    }
-
-    private class SendMessage extends Thread {
-        @Override
-        public void run() {
-            while (true) {
-                try {
-                    String message = reader.readLine().trim(); //чтение сообщения клиента
-                    if (message.split(" ",2)[0].equals("/file")){
-                        sendFileOnClient(message.split(" ",2)[1]);
-                    } else {
-                        if(!message.equals("")) {
-                            output.writeUTF(message);
-                            if (message.equals("/quit")) {
-                                closeSocket();
-                                System.exit(-1);
-                                break;
-                            }
-                            output.flush();
-                        }
-                    }
-                } catch (IOException e) {
-                    System.out.println("Ошибка отправки сообщения");
-                    closeSocket();
+        if (message.split(" ",2)[0].equals("/file")){
+            sendFileOnClient(message.split(" ",2)[1], channel);
+        } else {
+            if(!message.equals("")) {
+                buffer.limit(message.length());
+                buffer.clear();
+                buffer = ByteBuffer.wrap(message.getBytes());
+                channel.write(buffer);
+                if (message.equals("/quit")) {
+                    closeSocket(key);
                     System.exit(-1);
                 }
             }
         }
+    }
 
-        public void sendFileOnClient(String fileName) throws IOException{
-            try {
-                File file = new File(fileName);
-                long length = file.length();
-                if (length > MAX_FILE_SIZE){
-                    System.out.println("Привышен размер файла (максимум 5Мб)");
-                } else {
-                    int bytes;
-                    byte[] buffer = new byte[4*1024];
-                    FileInputStream fileInputStream = new FileInputStream(file);
+    public void sendFileOnClient(String fileName,SocketChannel channel) throws IOException{
+        try {
+            File file = new File(fileName);
+            long length = file.length();
+            if (length > MAX_FILE_SIZE){
+                System.out.println("Превышен размер файла (максимум 5Мб)");
+            } else {
+                FileInputStream fileInputStream = new FileInputStream(file);
+                byte[] bufferFile = fileInputStream.readAllBytes();
+                Path name = Paths.get(fileName).getFileName();
 
-                    Path name = Paths.get(fileName).getFileName();
-                    output.writeUTF("/file " + name);
-                    output.flush();
+                String fileMsg = "/file " + name.toString().length() + " " + name + " " + bufferFile.length + " ";
+                buffer.clear();
+                buffer = ByteBuffer.wrap(fileMsg.getBytes());
+                channel.write(buffer);
 
-                    output.writeLong(length);
-                    output.flush();
+                buffer = ByteBuffer.allocate(MAX_FILE_SIZE);
+                buffer.clear();
+                buffer = ByteBuffer.wrap(bufferFile);
+                channel.write(buffer);
 
-                    while ((bytes=fileInputStream.read(buffer))>0) {
-                        output.write(buffer, 0, bytes);
-                    }
-                    fileInputStream.close();
-                }
-            } catch (FileNotFoundException e){
-                System.out.println("Файл не найден. Укажите файл как: Путь к файлу\\имя файла");
+                fileInputStream.close();
             }
+        } catch (FileNotFoundException e){
+            System.out.println("Файл не найден. Укажите файл как: Путь к файлу\\имя файла");
+        }
+    }
+
+    private void read(SelectionKey key) {
+        try {
+            SocketChannel clientSocket = (SocketChannel) key.channel();
+            if (!isConnected) {
+                buffer = ByteBuffer.allocate(1000);
+                buffer.clear();
+                clientSocket.read(buffer);
+                if (new String(buffer.array()).trim().equals("/refuse")) {
+                    System.out.println("Это имя уже занято");
+                } else {
+                    isConnected = true;
+                    System.out.println("Вы подключены");
+                }
+            } else {
+                receiveMessage(clientSocket,key);
+            }
+            key.interestOps(SelectionKey.OP_WRITE);
+        } catch (IOException e) {
+            System.out.println("Ошибка получения сообщения");
+            closeSocket(key);
+            System.exit(-1);
+        }
+    }
+
+    private void receiveMessage(SocketChannel channel,SelectionKey key) throws IOException{
+        Arrays.fill(buffer.array(), (byte) 0);
+        buffer = ByteBuffer.allocate(100000);
+        buffer.clear();
+        channel.read(buffer);
+        String msg = new String(buffer.array()).trim();
+        if(!msg.equals("")) {
+            String[] partsOfMsg = msg.split(";", 3);
+            String[] fileFromServer = partsOfMsg[2].split(" ");
+            if (fileFromServer[0].equals("/file")) {
+                receiveFileOnClient(fileFromServer, channel);
+            } else {
+                if (partsOfMsg[2].equals("/stop")) {
+                    System.out.println("Работа сервера остановлена");
+                    closeSocket(key);
+                    System.exit(-1);
+                } else {
+                    String text = String.format("<%s> [%s]: %s", partsOfMsg[0], partsOfMsg[1], partsOfMsg[2]);
+                    System.out.println(text);
+                }
+            }
+        }
+    }
+
+    private void receiveFileOnClient(String[] messageStr, SocketChannel channel) throws IOException{
+        try {
+            new File("C:\\chat\\" + clientName).mkdirs();
+
+            int nameSize = Integer.parseInt(messageStr[1]);
+            StringBuilder receivedFile = new StringBuilder();
+            int i = 2;
+            while (receivedFile.length() < nameSize) {
+                receivedFile.append(messageStr[i++]).append(" ");
+            }
+
+            int fileSize = Integer.parseInt(messageStr[i]);
+            byte[] bufferFile = new byte[fileSize];
+            FileOutputStream fileOutputStream = new FileOutputStream("C:\\chat\\" + clientName + "\\" + receivedFile.toString().trim());
+            buffer = ByteBuffer.allocate(bufferFile.length);
+            buffer.clear();
+
+            while (buffer.position() < bufferFile.length) {
+                channel.read(buffer);
+            }
+
+            bufferFile = buffer.array();
+            fileOutputStream.write(bufferFile);
+            fileOutputStream.close();
+
+            System.out.println("Получен файл " + receivedFile);
+        } catch (FileNotFoundException e) {
+            System.out.println("Ошибка при получении файла");
+        }
+    }
+
+
+    private void closeSocket(SelectionKey key){
+        try {
+            clientChannel.close();
+            key.cancel();
+            thread.interrupt();
+        } catch (IOException e) {
+            System.out.println("Ошибка при закрытии сокета");
+            System.exit(-1);
         }
     }
 }

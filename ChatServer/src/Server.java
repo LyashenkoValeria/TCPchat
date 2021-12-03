@@ -1,5 +1,7 @@
 import java.io.*;
-import java.net.*;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -8,36 +10,16 @@ import java.util.*;
 
 public class Server {
     private static final int PORT = 8888;
-    private ServerSocket serverSocket;
-    private DataInputStream input;
-    private DataOutputStream output;
+    private ServerSocketChannel serverSocket;
+    private Selector selector;
+    private ByteBuffer buffer;
     private static BufferedReader readerServer;
-    private List<ClientConnection> clientList = new ArrayList<>();
+    private Thread readerThread;
     private List<String> nameList = new ArrayList<>();
+    private List<ClientChannel> clientList = new ArrayList<>();
+    private final static int MAX_FILE_SIZE = 5242880; // 5Mb
 
-    //Поток для чтения команд с консоли и остановки сервера
-    Runnable readServerCommand = () -> {
-        try {
-            readerServer = new BufferedReader(new InputStreamReader(System.in));
-            while (true) {
-                String command = readerServer.readLine();
-                if (command.equals("/stop")) {
-                    for (ClientConnection client : clientList) {
-                        output = new DataOutputStream(client.socket.getOutputStream());
-                        output.writeUTF("/stop");
-                        output.flush();
-                        System.out.println(String.format("Клиент %s отключен", client.clientName));
-                        client.socket.close();
-                    }
-                    System.out.println("Сервер закончил работу");
-                    serverSocket.close();
-                    System.exit(1);
-                }
-            }
-        } catch (IOException e) {
-            System.out.println("Ошибка чтения команды серверу");
-        }
-    };
+
 
     public static void main(String[] args) {
         new Server().launch();
@@ -46,138 +28,236 @@ public class Server {
     private void launch() {
         System.out.println("Сервер начал работу");
         try {
-            serverSocket = new ServerSocket(PORT, 5);
-            Thread commandThread = new Thread(readServerCommand);
-            commandThread.start();
+            selector = Selector.open();
+            serverSocket = ServerSocketChannel.open();
+            serverSocket.socket().bind(new InetSocketAddress(PORT));
+            serverSocket.configureBlocking(false);
+            serverSocket.register(selector, SelectionKey.OP_ACCEPT);
+
+            buffer = ByteBuffer.allocate(MAX_FILE_SIZE);
+
+            readerThread = new Thread(()-> {
+                try {
+                    readerServer = new BufferedReader(new InputStreamReader(System.in));
+                    while (true) {
+                        String command = readerServer.readLine();
+                        if (command.equals("/stop")) {
+                            for (ClientChannel client : clientList) {
+                                client.send(command, client.clientName);
+                                client.socketChannel.close();
+                                System.out.println(String.format("Клиент %s отключен", client.clientName));
+                            }
+                            closeServer();
+                        }
+                    }
+                } catch (IOException e) {
+                    System.out.println("Ошибка при чтении с консоли");
+                }
+            });
+            readerThread.start();
+
             while (true) {
-                Socket clientSocket = serverSocket.accept(); //ожидание подключения
-
-                //добавление нового соедиение
-                input = new DataInputStream(clientSocket.getInputStream());
-                String nameLine = input.readUTF();
-                String name = nameLine.split(" ")[0];
-
-                if (nameList.contains(name)) {
-                    output = new DataOutputStream(clientSocket.getOutputStream());
-                    output.writeUTF("/refuse");
-                    output.flush();
-                } else {
-                    ClientConnection newClient = new ClientConnection(clientSocket, name, nameLine.split(" ")[1].trim());
-                    System.out.println("Подключен новый клиент " + name);
-                    newClient.start();
-                    nameList.add(name);
-                    clientList.add(newClient);
-                    for (ClientConnection client : clientList) {
-                        client.send("Клиент " + name + " подключился", name);
+                selector.select();
+                Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
+                SelectionKey key;
+                while (keys.hasNext()) {
+                    key = keys.next();
+                    keys.remove();
+                    if (key.isAcceptable()) {
+                        accept(key);
+                    }
+                    if (key.isReadable()) {
+                        read(key);
                     }
                 }
             }
+
         } catch (IOException e) {
             System.out.println("Ошибка подключения сервера");
             System.exit(1);
         } finally {
             try {
-                System.out.println("Отключение сервера");
-                serverSocket.close();
+                closeServer();
             } catch (IOException e) {
+                System.out.println("Ошибка при закрытии сервера");
+                System.exit(1);
             }
         }
     }
 
-
-    private class ClientConnection extends Thread {
-        private Socket socket;
-        private String clientName;
-        private String timeZone;
-        private DataInputStream inputClient;
-        private DataOutputStream outputClient;
-
-
-        public ClientConnection(Socket socket, String clientName, String timeZone) {
-            this.socket = socket;
-            this.clientName = clientName;
-            this.timeZone = timeZone;
-
-            try {
-                inputClient = new DataInputStream(socket.getInputStream());
-                outputClient = new DataOutputStream(socket.getOutputStream());
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
+    private void accept(SelectionKey key) {
+        try {
+            ServerSocketChannel serverSocketChannel = (ServerSocketChannel) key.channel();
+            SocketChannel clientChannel = serverSocketChannel.accept();
+            clientChannel.configureBlocking(false);
+            clientChannel.register(selector, SelectionKey.OP_READ);
+        } catch (IOException e) {
+            System.out.println("Ошибка подключения клиента к серверу");
+            System.exit(1);
         }
+    }
 
-        @Override
-        public void run() {
-            try {
-                while (true) {
-                    String msg = inputClient.readUTF();
-                    if (msg.split(" ", 2)[0].equals("/file")) {
-                        String name = msg.split(" ", 2)[1];
-                        receiveFileOnServer(name);
-                    } else {
-                        if (msg.equals("/quit")) {
-                            closeSocket();
-                            break;
+    private void read(SelectionKey key) {
+        SocketChannel clientChannel = (SocketChannel) key.channel();
+        try {
+            Arrays.fill(buffer.array(), (byte) 0);
+            clientChannel.read(buffer);
+            String msg = new String(buffer.array());
+            switch (msg.split(" ")[0].trim()) {
+                case "/name" -> {
+                    String name = msg.split(" ")[1];
+                    String connectionStr = "/success";
+
+                    if (nameList.contains(name)) {
+                        connectionStr = "/refuse";
+                    }
+
+                    buffer = ByteBuffer.allocate(connectionStr.length());
+                    buffer.flip();
+                    buffer = ByteBuffer.wrap(connectionStr.getBytes());
+                    clientChannel.write(buffer);
+                    buffer.clear();
+                    buffer = ByteBuffer.allocate(100000);
+
+                    if (connectionStr.equals("/success")) {
+                        System.out.println("Подключен новый клиент " + name);
+                        nameList.add(name);
+                        ClientChannel newClient = new ClientChannel(clientChannel, name, msg.split(" ")[2].trim());
+                        clientList.add(newClient);
+                        for (ClientChannel client : clientList) {
+                            client.send("Клиент " + name + " подключился", name);
                         }
-                        for (ClientConnection client : clientList) {
-                            client.send(msg, this.clientName);
+                    }
+
+                }
+                case "/file" -> {
+                    String[] partOfMsg = msg.split(" ");
+                    receiveFileOnServer(partOfMsg, clientChannel);
+                    buffer = ByteBuffer.allocate(100000);
+                }
+                case "/quit" -> {
+                    for (ClientChannel client : clientList) {
+                        if (client.socketChannel.equals(clientChannel)) {
+                            client.closeSocket();
+                            key.cancel();
+                            break;
                         }
                     }
                 }
-            } catch (IOException e) {
+                default -> {
+                    String name = "";
+                    for (ClientChannel client : clientList) {
+                        if (client.socketChannel.equals(clientChannel)) {
+                            name = client.clientName;
+                            break;
+                        }
+                    }
+                    for (ClientChannel client : clientList) {
+                        client.send(msg, name);
+                    }
+                }
             }
+        } catch (IOException e) {
+            System.out.println("Ошибка чтения данных полученных от клиента");
+            ClientChannel disconnectedClient = null;
+            for (ClientChannel client : clientList) {
+                if (client.socketChannel.equals(clientChannel)) {
+                    disconnectedClient = client;
+                    break;
+                }
+            }
+            if (disconnectedClient != null) {
+                disconnectedClient.closeSocket();
+            }
+        }
+    }
+
+    private void receiveFileOnServer(String[] messageStr, SocketChannel channel) throws IOException {
+        try {
+            int nameSize = Integer.parseInt(messageStr[1]);
+            StringBuilder receivedFile = new StringBuilder();
+            int i = 2;
+            while (receivedFile.length() < nameSize) {
+                receivedFile.append(messageStr[i++]).append(" ");
+            }
+
+            int fileSize = Integer.parseInt(messageStr[i]);
+            byte[] bufferFile = new byte[fileSize];
+            FileOutputStream fileOutputStream = new FileOutputStream(receivedFile.toString().trim());
+            buffer = ByteBuffer.allocate(bufferFile.length);
+            buffer.clear();
+
+            while (buffer.position() < bufferFile.length) {
+                channel.read(buffer);
+            }
+
+            bufferFile = buffer.array();
+            fileOutputStream.write(bufferFile);
+            fileOutputStream.close();
+
+            System.out.println("Получен файл " + receivedFile);
+
+            for (ClientChannel client : clientList) {
+                if (client.socketChannel != channel) client.sendFileOnServer(receivedFile.toString().trim(), client.clientName);
+            }
+        } catch (FileNotFoundException e) {
+            System.out.println("Файл не найден");
+        }
+    }
+
+    private void closeServer() throws IOException{
+        System.out.println("Сервер закончил работу");
+        serverSocket.close();
+        readerThread.interrupt();
+        System.exit(1);
+    }
+
+    private class ClientChannel {
+        private SocketChannel socketChannel;
+        private String clientName;
+        private String timeZone;
+
+        public ClientChannel(SocketChannel socketChannel, String clientName, String timeZone) {
+            this.socketChannel = socketChannel;
+            this.clientName = clientName;
+            this.timeZone = timeZone;
         }
 
         private void send(String message, String sender) {
             try {
                 LocalTime localTime = LocalTime.now(ZoneId.of(timeZone));
                 DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm");
-                outputClient.writeUTF(localTime.format(formatter) + ";" + sender + ";" + message);
-                outputClient.flush();
+                String formatMsg = localTime.format(formatter) + ";" + sender + ";" + message;
+                buffer = ByteBuffer.wrap(formatMsg.getBytes());
+                socketChannel.write(buffer);
+                buffer.clear();
             } catch (IOException e) {
                 System.out.println("Ошибка при отправке сообщения другим клиентам");
                 System.exit(1);
             }
         }
 
-        private void receiveFileOnServer(String receivedFile) throws IOException {
-            try {
-                int bytes;
-                FileOutputStream fileOutputStream = new FileOutputStream(receivedFile);
-                long fileSize = inputClient.readLong();
-                byte[] buffer = new byte[4 * 1024];
-
-                while (fileSize > 0 && (bytes = inputClient.read(buffer, 0, (int) Math.min(buffer.length, fileSize))) != -1) {
-                    fileOutputStream.write(buffer, 0, bytes);
-                    fileSize -= bytes;
-                }
-                fileOutputStream.close();
-                System.out.println("Получен файл " + receivedFile);
-                for (ClientConnection client : clientList) {
-                    if (client != this) client.sendFileOnServer(receivedFile, this.clientName);
-                }
-            } catch (FileNotFoundException e) {
-                System.out.println("Файл не найден");
-            }
-        }
-
         private void sendFileOnServer(String sentFile, String sender) throws IOException {
             try {
                 File file = new File(sentFile);
-                long length = file.length();
-                int bytes;
-                byte[] buffer = new byte[4 * 1024];
                 FileInputStream fileInputStream = new FileInputStream(file);
+                byte[] bufferFile = fileInputStream.readAllBytes();
 
-                outputClient.writeUTF("/file " + sentFile);
-                outputClient.flush();
+                String fileMsg = "/file " + sentFile.length() + " " + sentFile + " " + bufferFile.length + " ";
 
-                outputClient.writeLong(length);
-                outputClient.flush();
+                LocalTime localTime = LocalTime.now(ZoneId.of(timeZone));
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm");
+                String formatMsg = localTime.format(formatter) + ";" + sender + ";" + fileMsg;
 
-                while ((bytes = fileInputStream.read(buffer)) > 0) {
-                    outputClient.write(buffer, 0, bytes);
-                }
+                buffer.clear();
+                buffer = ByteBuffer.wrap(formatMsg.getBytes());
+                socketChannel.write(buffer);
+
+                buffer = ByteBuffer.allocate(MAX_FILE_SIZE);
+                buffer.clear();
+                buffer = ByteBuffer.wrap(bufferFile);
+                socketChannel.write(buffer);
+
                 fileInputStream.close();
             } catch (FileNotFoundException e) {
                 System.out.println("Файл не найден");
@@ -185,20 +265,19 @@ public class Server {
             }
         }
 
-        private void closeSocket() {
+        private void closeSocket(){
             try {
                 System.out.println(String.format("Клиент %s отключен", this.clientName));
                 clientList.remove(this);
-                for (ClientConnection client : clientList) {
+                for (ClientChannel client : clientList) {
                     client.send("Клиент " + this.clientName + " отключился", this.clientName);
                 }
                 nameList.remove(clientName);
-                inputClient.close();
-                outputClient.close();
-                socket.close();
-            } catch (IOException e) {
+                socketChannel.close();
+
+            } catch (Exception e) {
                 System.out.println("Ошибка при закрытии сокета");
-                System.exit(1);
+                System.exit(-1);
             }
         }
     }
